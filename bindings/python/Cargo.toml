@@ -14,18 +14,23 @@ categories.workspace = true
 name = "semantic_text_splitter"
 crate-type = ["cdylib"]
 
+[features]
+default = ["abi3"]
+abi3 = ["pyo3/abi3-py310"]
+abi3t = ["pyo3/abi3t-py315"]
+
 [dependencies]
-pyo3 = { version = "0.23", features = ["abi3-py39"] }
-rayon = "1.10"
+pyo3 = "0.29"
+rayon = "1.11"
 text-splitter = { path = "../..", features = [
     "code",
     "markdown",
     "tiktoken-rs",
     "tokenizers",
 ] }
-tiktoken-rs = "0.6"
-tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
-tree-sitter = "0.25"
+tiktoken-rs = "0.12"
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
+tree-sitter = "0.26"
 
 [lints]
 workspace = true

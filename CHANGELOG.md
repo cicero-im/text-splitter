@@ -1,5 +1,151 @@
 # Changelog
 
+## Unreleased
+
+#### Python
+
+- No longer ship `abi3t` (free-threaded stable ABI) wheels for now, reverting the addition from v0.32.0. As of maturin 1.14.1, an `abi3t` wheel is only built when a CPython 3.15+ free-threaded interpreter is available at build time, which won't happen until Python 3.15 is released. Free-threaded `cp314t` wheels and stable-ABI `abi3` wheels (CPython 3.10+) are unaffected.
+
+## v0.32.0
+
+### What's New
+
+- Improve performance for documents that have very distant semantic boundaries.
+
+#### Python
+
+- Build `abi3t` wheels for free-threaded Python.
+- Release the GIL while loading Rust-backed tokenizers and running Rust-only chunking calls for `TextSplitter`, `MarkdownSplitter`, and `CodeSplitter`. Callback-backed splitters continue to hold the GIL while calling into Python.
+
+## v0.31.0
+
+### Breaking Changes
+
+- Updated `tokenizers` to v0.23 and `tiktoken-rs` to v0.12. Some Hugging Face
+  tokenizers include truncation settings, and `tokenizers` v0.23 may return
+  the truncated size for those tokenizers instead of exposing overflow encodings.
+  Disable truncation with `tokenizer.with_truncation(None)` before constructing
+  a splitter if chunk sizes should reflect the full input text.
+
+## v0.30.1
+
+#### Python
+
+- Fix missing Python release documentation
+
+## v0.30.0
+
+### What's New
+
+- updated `tiktoken-rs` to v0.11
+
+#### Rust
+
+- MSRV updated to 1.86.0
+
+## v0.29.1
+
+### Python
+
+- Fix missing pyproject.toml
+
+## v0.29.0
+
+### What's New
+
+- Updated `tiktoken-rs` to v0.9
+- Updated `tree-sitter` to v0.26
+
+### Rust
+
+- MSRV updated to 1.83.0
+
+## v0.28.0
+
+### What's New
+
+- Updated `tokenizers` to v0.22
+
+#### Python
+
+- Minimum Python version updated to 3.10
+
+## v0.27.0
+
+### What's New
+
+- Updated `tiktoken-rs` to v0.7.0
+
+## v0.26.0
+
+### What's New
+
+- Updated to `icu` v2.0 for all unicode segmentation.
+- Minimum Rust version updated to 1.82.0
+
+## v0.25.1
+
+### What's New
+
+- Use `memchr` crate instead of `regex` for parsing phase in `TextSplitter`. This should improve performance in how quickly the text is parsed when scanning for newline characters.
+- Implement `ChunkSizer` trait automatically for many more wrappers and references to types that already implement `ChunkSizer`.
+
+## v0.25.0
+
+### Breaking Changes
+
+#### Rust
+
+- Remove support for `rust-tokenizers` crate. This crate hasn't been updated in several years and brings in depednencies that have security warnings.
+
+### What's New
+
+- Use faster encoding method for `tokenizers` library, which improves performance with usage of huggingface tokenizers.
+
+## v0.24.2
+
+### Fixes
+
+- Python packages target a newer version of libc to hopefully fix header file issues with tree-sitter.
+
+### What's New
+
+- MSRV updated to 1.81.0
+
+## v0.24.1
+
+### What's New
+
+Added a new `chunk_char_indices` method to the Rust splitters.
+
+```rust
+use text_splitter::{Characters, ChunkCharIndex, TextSplitter};
+
+let text = "\r\na̐éö̲\r\n";
+let splitter = TextSplitter::new(3);
+let chunks = splitter.chunk_char_indices(text).collect::<Vec<_>>();
+
+assert_eq!(
+    vec![
+        ChunkCharIndex {
+            chunk: "a̐é",
+            byte_offset: 2,
+            char_offset: 2
+        },
+        ChunkCharIndex {
+            chunk: "ö̲",
+            byte_offset: 7,
+            char_offset: 5
+        }
+    ],
+    chunks
+);
+```
+
+The pulls logic from the Python bindings down into the core library. This will be more expensive than just byte offsets, and for most usage in Rust, just having byte offsets is sufficient.
+
+However, when interfacing with other languages or systems that require character offsets, this will track the character offsets for you, accounting for any trimming that may have occurred.
+
 ## v0.24.0
 
 ### What's New

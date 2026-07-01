@@ -1,5 +1,5 @@
 #![doc = include_str!("../README.md")]
-#![cfg_attr(docsrs, feature(doc_auto_cfg, doc_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 mod chunk_size;
 mod splitter;
@@ -10,6 +10,6 @@ pub use chunk_size::{
 };
 #[cfg(feature = "markdown")]
 pub use splitter::MarkdownSplitter;
-pub use splitter::TextSplitter;
+pub use splitter::{ChunkCharIndex, TextSplitter};
 #[cfg(feature = "code")]
 pub use splitter::{CodeSplitter, CodeSplitterError};

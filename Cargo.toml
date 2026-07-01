@@ -2,7 +2,7 @@
 members = ["bindings/*"]
 
 [workspace.package]
-version = "0.24.0"
+version = "0.32.0"
 authors = ["Ben Brandt <benjamin.j.brandt@gmail.com>"]
 edition = "2021"
 description = "Split text into semantic chunks, up to a desired chunk size. Supports calculating length by characters and tokens, and is callable from Rust and Python."
@@ -51,7 +51,7 @@ exclude = [
     "*.yml",
     "*.yaml",
 ]
-rust-version = "1.80.0"
+rust-version = "1.86.0"
 
 [package.metadata.docs.rs]
 all-features = true
@@ -60,36 +60,32 @@ rustdoc-args = ["--cfg", "docsrs"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-ahash = "0.8.7"
+ahash = "0.8.12"
 auto_enums = "0.8"
-either = "1.6"
-icu_provider = { version = "1.5.0", features = ["sync"] }
-icu_segmenter = "1.5.0"
-itertools = "0.14"
+either = "1.16"
+icu_provider = { version = "2", features = ["sync"] }
+icu_segmenter = "2"
+itertools = "0.15"
+memchr = "2.8.1"
 pulldown-cmark = { version = "0.13", default-features = false, optional = true }
-regex = "1.11.1"
-rust_tokenizers = { version = "8", optional = true }
-strum = { version = "0.27", features = ["derive"] }
-thiserror = "2.0.11"
-tiktoken-rs = { version = "0.6", optional = true }
-tokenizers = { version = "0.21", default-features = false, optional = true }
-tree-sitter = { version = "0.25", optional = true }
+strum = { version = "0.28", features = ["derive"] }
+thiserror = "2.0.18"
+tiktoken-rs = { version = "0.12", optional = true }
+tokenizers = { version = "0.23", default-features = false, optional = true }
+tree-sitter = { version = "0.26", optional = true }
 
 [dev-dependencies]
-cached-path = { version = "0.6", default-features = false, features = [
-    "rustls-tls",
-] }
 dirs = "6.0.0"
-divan = "0.1.17"
-fake = "4"
-insta = { version = "1.42", features = ["glob", "yaml"] }
+divan = "0.1.21"
+fake = "5"
+insta = { version = "1.47", features = ["glob", "yaml"] }
 more-asserts = "0.3"
-rayon = "1.10"
-tokenizers = { version = "0.21", default-features = false, features = [
+rayon = "1.11"
+tokenizers = { version = "0.23", default-features = false, features = [
     "onig",
     "http",
 ] }
-tree-sitter-rust = "0.23"
+tree-sitter-rust = "0.24"
 
 [[bench]]
 name = "chunk_size"
@@ -98,7 +94,6 @@ harness = false
 [features]
 code = ["dep:tree-sitter"]
 markdown = ["dep:pulldown-cmark"]
-rust-tokenizers = ["dep:rust_tokenizers"]
 tiktoken-rs = ["dep:tiktoken-rs"]
 tokenizers = ["dep:tokenizers", "tokenizers/onig"]
 

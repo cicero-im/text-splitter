@@ -9,12 +9,13 @@ use crate::{
     ChunkConfig, ChunkSizer,
 };
 
+use super::ChunkCharIndex;
+
 /// Indicates there was an error with creating a `CodeSplitter`.
 /// The `Display` implementation will provide a human-readable error message to
 /// help debug the issue that caused the error.
 #[derive(Error, Debug)]
 #[error(transparent)]
-#[allow(clippy::module_name_repetitions)]
 pub struct CodeSplitterError(#[from] CodeSplitterErrorRepr);
 
 /// Private error and free to change across minor version of the crate.
@@ -31,7 +32,6 @@ enum CodeSplitterErrorRepr {
 /// semantic units that fit within the chunk size. Also will attempt to merge
 /// neighboring chunks if they can fit within the given chunk size.
 #[derive(Debug)]
-#[allow(clippy::module_name_repetitions)]
 pub struct CodeSplitter<Sizer>
 where
     Sizer: ChunkSizer,
@@ -80,21 +80,21 @@ where
     /// ## Method
     ///
     /// To preserve as much semantic meaning within a chunk as possible, each chunk is composed of the largest semantic units that can fit in the next given chunk. For each splitter type, there is a defined set of semantic levels. Here is an example of the steps used:
-    //
-    // 1. Split the text by a increasing semantic levels.
-    // 2. Check the first item for each level and select the highest level whose first item still fits within the chunk size.
-    // 3. Merge as many of these neighboring sections of this level or above into a chunk to maximize chunk length.
-    //    Boundaries of higher semantic levels are always included when merging, so that the chunk doesn't inadvertantly cross semantic boundaries.
-    //
-    // The boundaries used to split the text if using the `chunks` method, in ascending order:
-    //
-    // 1. Characters
-    // 2. [Unicode Grapheme Cluster Boundaries](https://www.unicode.org/reports/tr29/#Grapheme_Cluster_Boundaries)
-    // 3. [Unicode Word Boundaries](https://www.unicode.org/reports/tr29/#Word_Boundaries)
-    // 4. [Unicode Sentence Boundaries](https://www.unicode.org/reports/tr29/#Sentence_Boundaries)
-    // 5. Ascending depth of the syntax tree. So function would have a higher level than a statement inside of the function, and so on.
-    //
-    // Splitting doesn't occur below the character level, otherwise you could get partial bytes of a char, which may not be a valid unicode str.
+    ///
+    /// 1. Split the text by a increasing semantic levels.
+    /// 2. Check the first item for each level and select the highest level whose first item still fits within the chunk size.
+    /// 3. Merge as many of these neighboring sections of this level or above into a chunk to maximize chunk length.
+    ///    Boundaries of higher semantic levels are always included when merging, so that the chunk doesn't inadvertantly cross semantic boundaries.
+    ///
+    /// The boundaries used to split the text if using the `chunks` method, in ascending order:
+    ///
+    /// 1. Characters
+    /// 2. [Unicode Grapheme Cluster Boundaries](https://www.unicode.org/reports/tr29/#Grapheme_Cluster_Boundaries)
+    /// 3. [Unicode Word Boundaries](https://www.unicode.org/reports/tr29/#Word_Boundaries)
+    /// 4. [Unicode Sentence Boundaries](https://www.unicode.org/reports/tr29/#Sentence_Boundaries)
+    /// 5. Ascending depth of the syntax tree. So function would have a higher level than a statement inside of the function, and so on.
+    ///
+    /// Splitting doesn't occur below the character level, otherwise you could get partial bytes of a char, which may not be a valid unicode str.
     ///
     /// ```
     /// use text_splitter::CodeSplitter;
@@ -118,18 +118,45 @@ where
     /// See [`CodeSplitter::chunks`] for more information.
     ///
     /// ```
-    /// use text_splitter::CodeSplitter;
+    /// use text_splitter::{ChunkCharIndex, CodeSplitter};
     ///
     /// let splitter = CodeSplitter::new(tree_sitter_rust::LANGUAGE, 10).expect("Invalid language");
     /// let text = "Some text\n\nfrom a\ndocument";
     /// let chunks = splitter.chunk_indices(text).collect::<Vec<_>>();
     ///
     /// assert_eq!(vec![(0, "Some text"), (11, "from a"), (18, "document")], chunks);
+    /// ```
     pub fn chunk_indices<'splitter, 'text: 'splitter>(
         &'splitter self,
         text: &'text str,
     ) -> impl Iterator<Item = (usize, &'text str)> + 'splitter {
         Splitter::<_>::chunk_indices(self, text)
+    }
+
+    /// Returns an iterator over chunks of the text with their byte and character offsets.
+    /// Each chunk will be up to the `chunk_capacity`.
+    ///
+    /// See [`CodeSplitter::chunks`] for more information.
+    ///
+    /// This will be more expensive than just byte offsets, and for most usage in Rust, just
+    /// having byte offsets is sufficient. But when interfacing with other languages or systems
+    /// that require character offsets, this will track the character offsets for you,
+    /// accounting for any trimming that may have occurred.
+    ///
+    /// ```
+    /// use text_splitter::{ChunkCharIndex, CodeSplitter};
+    ///
+    /// let splitter = CodeSplitter::new(tree_sitter_rust::LANGUAGE, 10).expect("Invalid language");
+    /// let text = "Some text\n\nfrom a\ndocument";
+    /// let chunks = splitter.chunk_char_indices(text).collect::<Vec<_>>();
+    ///
+    /// assert_eq!(vec![ChunkCharIndex {chunk: "Some text", byte_offset: 0, char_offset: 0}, ChunkCharIndex {chunk: "from a", byte_offset: 11, char_offset: 11}, ChunkCharIndex {chunk: "document", byte_offset: 18, char_offset: 18}], chunks);
+    /// ```
+    pub fn chunk_char_indices<'splitter, 'text: 'splitter>(
+        &'splitter self,
+        text: &'text str,
+    ) -> impl Iterator<Item = ChunkCharIndex<'text>> + 'splitter {
+        Splitter::<_>::chunk_char_indices(self, text)
     }
 }
 
@@ -248,6 +275,34 @@ mod tests {
         assert_eq!(
             chunks,
             vec![(0, "fn main()"), (10, "{\n    let x = 5;"), (27, "}")]
+        );
+    }
+
+    #[test]
+    fn rust_splitter_char_indices() {
+        let splitter = CodeSplitter::new(tree_sitter_rust::LANGUAGE, 16).unwrap();
+        let text = "fn main() {\n    let x = 5;\n}";
+        let chunks = splitter.chunk_char_indices(text).collect::<Vec<_>>();
+
+        assert_eq!(
+            chunks,
+            vec![
+                ChunkCharIndex {
+                    chunk: "fn main()",
+                    byte_offset: 0,
+                    char_offset: 0
+                },
+                ChunkCharIndex {
+                    chunk: "{\n    let x = 5;",
+                    byte_offset: 10,
+                    char_offset: 10
+                },
+                ChunkCharIndex {
+                    chunk: "}",
+                    byte_offset: 27,
+                    char_offset: 27
+                }
+            ]
         );
     }
 

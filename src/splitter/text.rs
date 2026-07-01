@@ -3,23 +3,22 @@
 Semantic splitting of text documents.
 */
 
-use std::{ops::Range, sync::LazyLock};
+use std::ops::Range;
 
 use itertools::Itertools;
-use regex::Regex;
+use memchr::memchr2_iter;
 
 use crate::{
     splitter::{SemanticLevel, Splitter},
     ChunkConfig, ChunkSizer,
 };
 
-use super::fallback::GRAPHEME_SEGMENTER;
+use super::{fallback::GRAPHEME_SEGMENTER, ChunkCharIndex};
 
 /// Default plain-text splitter. Recursively splits chunks into the largest
 /// semantic units that fit within the chunk size. Also will attempt to merge
 /// neighboring chunks if they can fit within the given chunk size.
 #[derive(Debug)]
-#[allow(clippy::module_name_repetitions)]
 pub struct TextSplitter<Sizer>
 where
     Sizer: ChunkSizer,
@@ -52,22 +51,22 @@ where
     /// ## Method
     ///
     /// To preserve as much semantic meaning within a chunk as possible, each chunk is composed of the largest semantic units that can fit in the next given chunk. For each splitter type, there is a defined set of semantic levels. Here is an example of the steps used:
-    //
-    // 1. Split the text by a increasing semantic levels.
-    // 2. Check the first item for each level and select the highest level whose first item still fits within the chunk size.
-    // 3. Merge as many of these neighboring sections of this level or above into a chunk to maximize chunk length.
-    //    Boundaries of higher semantic levels are always included when merging, so that the chunk doesn't inadvertantly cross semantic boundaries.
-    //
-    // The boundaries used to split the text if using the `chunks` method, in ascending order:
-    //
-    // 1. Characters
-    // 2. [Unicode Grapheme Cluster Boundaries](https://www.unicode.org/reports/tr29/#Grapheme_Cluster_Boundaries)
-    // 3. [Unicode Word Boundaries](https://www.unicode.org/reports/tr29/#Word_Boundaries)
-    // 4. [Unicode Sentence Boundaries](https://www.unicode.org/reports/tr29/#Sentence_Boundaries)
-    // 5. Ascending sequence length of newlines. (Newline is `\r\n`, `\n`, or `\r`)
-    //    Each unique length of consecutive newline sequences is treated as its own semantic level. So a sequence of 2 newlines is a higher level than a sequence of 1 newline, and so on.
-    //
-    // Splitting doesn't occur below the character level, otherwise you could get partial bytes of a char, which may not be a valid unicode str.
+    ///
+    /// 1. Split the text by a increasing semantic levels.
+    /// 2. Check the first item for each level and select the highest level whose first item still fits within the chunk size.
+    /// 3. Merge as many of these neighboring sections of this level or above into a chunk to maximize chunk length.
+    ///    Boundaries of higher semantic levels are always included when merging, so that the chunk doesn't inadvertantly cross semantic boundaries.
+    ///
+    /// The boundaries used to split the text if using the `chunks` method, in ascending order:
+    ///
+    /// 1. Characters
+    /// 2. [Unicode Grapheme Cluster Boundaries](https://www.unicode.org/reports/tr29/#Grapheme_Cluster_Boundaries)
+    /// 3. [Unicode Word Boundaries](https://www.unicode.org/reports/tr29/#Word_Boundaries)
+    /// 4. [Unicode Sentence Boundaries](https://www.unicode.org/reports/tr29/#Sentence_Boundaries)
+    /// 5. Ascending sequence length of newlines. (Newline is `\r\n`, `\n`, or `\r`)
+    ///    Each unique length of consecutive newline sequences is treated as its own semantic level. So a sequence of 2 newlines is a higher level than a sequence of 1 newline, and so on.
+    ///
+    /// Splitting doesn't occur below the character level, otherwise you could get partial bytes of a char, which may not be a valid unicode str.
     ///
     /// ```
     /// use text_splitter::TextSplitter;
@@ -98,11 +97,37 @@ where
     /// let chunks = splitter.chunk_indices(text).collect::<Vec<_>>();
     ///
     /// assert_eq!(vec![(0, "Some text"), (11, "from a"), (18, "document")], chunks);
+    /// ```
     pub fn chunk_indices<'splitter, 'text: 'splitter>(
         &'splitter self,
         text: &'text str,
     ) -> impl Iterator<Item = (usize, &'text str)> + 'splitter {
         Splitter::<_>::chunk_indices(self, text)
+    }
+
+    /// Returns an iterator over chunks of the text with their byte and character offsets.
+    /// Each chunk will be up to the `chunk_capacity`.
+    ///
+    /// See [`TextSplitter::chunks`] for more information.
+    ///
+    /// This will be more expensive than just byte offsets, and for most usage in Rust, just
+    /// having byte offsets is sufficient. But when interfacing with other languages or systems
+    /// that require character offsets, this will track the character offsets for you,
+    /// accounting for any trimming that may have occurred.
+    ///
+    /// ```
+    /// use text_splitter::{Characters, ChunkCharIndex, TextSplitter};
+    ///
+    /// let splitter = TextSplitter::new(10);
+    /// let text = "Some text\n\nfrom a\ndocument";
+    /// let chunks = splitter.chunk_char_indices(text).collect::<Vec<_>>();
+    ///
+    /// assert_eq!(vec![ChunkCharIndex { chunk: "Some text", byte_offset: 0, char_offset: 0 }, ChunkCharIndex { chunk: "from a", byte_offset: 11, char_offset: 11 }, ChunkCharIndex { chunk: "document", byte_offset: 18, char_offset: 18 }], chunks);
+    pub fn chunk_char_indices<'splitter, 'text: 'splitter>(
+        &'splitter self,
+        text: &'text str,
+    ) -> impl Iterator<Item = ChunkCharIndex<'text>> + 'splitter {
+        Splitter::<_>::chunk_char_indices(self, text)
     }
 }
 
@@ -117,10 +142,16 @@ where
     }
 
     fn parse(&self, text: &str) -> Vec<(Self::Level, Range<usize>)> {
-        CAPTURE_LINEBREAKS
-            .find_iter(text)
-            .map(|m| {
-                let range = m.range();
+        memchr2_iter(b'\n', b'\r', text.as_bytes())
+            .map(|i| i..i + 1)
+            .coalesce(|a, b| {
+                if a.end == b.start {
+                    Ok(a.start..b.end)
+                } else {
+                    Err((a, b))
+                }
+            })
+            .map(|range| {
                 let level = GRAPHEME_SEGMENTER
                     .segment_str(text.get(range.start..range.end).unwrap())
                     .tuple_windows::<(usize, usize)>()
@@ -145,10 +176,6 @@ where
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct LineBreaks(usize);
 
-// Lazy so that we don't have to compile them more than once
-static CAPTURE_LINEBREAKS: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(\r\n)+|\r+|\n+").unwrap());
-
 impl SemanticLevel for LineBreaks {}
 
 #[cfg(test)]
@@ -157,7 +184,7 @@ mod tests {
 
     use fake::{Fake, Faker};
 
-    use crate::splitter::SemanticSplitRanges;
+    use crate::{splitter::SemanticSplitRanges, ChunkCharIndex};
 
     use super::*;
 
@@ -266,6 +293,30 @@ mod tests {
     }
 
     #[test]
+    fn chunk_char_indices() {
+        let text = " a b ";
+        let chunks = TextSplitter::new(1)
+            .chunk_char_indices(text)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            vec![
+                ChunkCharIndex {
+                    chunk: "a",
+                    byte_offset: 1,
+                    char_offset: 1
+                },
+                ChunkCharIndex {
+                    chunk: "b",
+                    byte_offset: 3,
+                    char_offset: 3,
+                },
+            ],
+            chunks
+        );
+    }
+
+    #[test]
     fn graphemes_fallback_to_chars() {
         let text = "a̐éö̲\r\n";
         let chunks = TextSplitter::new(ChunkConfig::new(1).with_trim(false))
@@ -283,6 +334,30 @@ mod tests {
         let chunks = TextSplitter::new(3).chunk_indices(text).collect::<Vec<_>>();
 
         assert_eq!(vec![(2, "a̐é"), (7, "ö̲")], chunks);
+    }
+
+    #[test]
+    fn grapheme_char_indices() {
+        let text = "\r\na̐éö̲\r\n";
+        let chunks = TextSplitter::new(3)
+            .chunk_char_indices(text)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            vec![
+                ChunkCharIndex {
+                    chunk: "a̐é",
+                    byte_offset: 2,
+                    char_offset: 2
+                },
+                ChunkCharIndex {
+                    chunk: "ö̲",
+                    byte_offset: 7,
+                    char_offset: 5
+                }
+            ],
+            chunks
+        );
     }
 
     #[test]

@@ -1,7 +1,11 @@
 use std::{
+    borrow::Cow,
+    cell::{Ref, RefMut},
     cmp::Ordering,
     fmt,
-    ops::{Range, RangeFrom, RangeFull, RangeInclusive, RangeTo, RangeToInclusive},
+    ops::{Deref, Range, RangeFrom, RangeFull, RangeInclusive, RangeTo, RangeToInclusive},
+    rc::Rc,
+    sync::Arc,
 };
 
 use ahash::AHashMap;
@@ -11,13 +15,14 @@ use thiserror::Error;
 mod characters;
 #[cfg(feature = "tokenizers")]
 mod huggingface;
-#[cfg(feature = "rust-tokenizers")]
-mod rust_tokenizers;
 #[cfg(feature = "tiktoken-rs")]
 mod tiktoken;
 
 use crate::trim::Trim;
 pub use characters::Characters;
+
+const PROBE_OVERSHOOT_DIVISOR: usize = 4;
+const PROBE_START_BYTE_FACTOR: usize = 8;
 
 /// Indicates there was an error with the chunk capacity configuration.
 /// The `Display` implementation will provide a human-readable error message to
@@ -192,6 +197,70 @@ pub trait ChunkSizer {
     fn size(&self, chunk: &str) -> usize;
 }
 
+impl<T> ChunkSizer for &T
+where
+    T: ChunkSizer,
+{
+    fn size(&self, chunk: &str) -> usize {
+        (*self).size(chunk)
+    }
+}
+
+impl<T> ChunkSizer for Ref<'_, T>
+where
+    T: ChunkSizer,
+{
+    fn size(&self, chunk: &str) -> usize {
+        self.deref().size(chunk)
+    }
+}
+
+impl<T> ChunkSizer for RefMut<'_, T>
+where
+    T: ChunkSizer,
+{
+    fn size(&self, chunk: &str) -> usize {
+        self.deref().size(chunk)
+    }
+}
+
+impl<T> ChunkSizer for Box<T>
+where
+    T: ChunkSizer,
+{
+    fn size(&self, chunk: &str) -> usize {
+        self.deref().size(chunk)
+    }
+}
+
+impl<T> ChunkSizer for Cow<'_, T>
+where
+    T: ChunkSizer + ToOwned + ?Sized,
+    <T as ToOwned>::Owned: ChunkSizer,
+{
+    fn size(&self, chunk: &str) -> usize {
+        self.as_ref().size(chunk)
+    }
+}
+
+impl<T> ChunkSizer for Rc<T>
+where
+    T: ChunkSizer,
+{
+    fn size(&self, chunk: &str) -> usize {
+        self.deref().size(chunk)
+    }
+}
+
+impl<T> ChunkSizer for Arc<T>
+where
+    T: ChunkSizer,
+{
+    fn size(&self, chunk: &str) -> usize {
+        self.as_ref().size(chunk)
+    }
+}
+
 /// Indicates there was an error with the chunk configuration.
 /// The `Display` implementation will provide a human-readable error message to
 /// help debug the issue that caused the error.
@@ -363,34 +432,51 @@ where
     }
 
     /// Find the best level to start splitting the text
-    pub fn find_correct_level<'text, L: fmt::Debug>(
+    pub fn find_correct_level<'text, L, Boundaries>(
         &mut self,
         offset: usize,
         capacity: &ChunkCapacity,
-        levels_with_first_chunk: impl Iterator<Item = (L, &'text str)>,
+        levels_with_first_chunk: impl Iterator<Item = (L, &'text str, Option<L>)>,
+        mut lower_boundaries_for: impl FnMut(Option<L>, usize) -> Boundaries,
         trim: Trim,
-    ) -> (Option<L>, Option<usize>) {
+    ) -> (Option<L>, Option<usize>)
+    where
+        L: Copy + fmt::Debug,
+        Boundaries: Iterator<Item = usize>,
+    {
         let mut semantic_level = None;
         let mut max_offset = None;
 
         // We assume that larger levels are also longer. We can skip lower levels if going to a higher level would result in a shorter text
-        let levels_with_first_chunk =
-            levels_with_first_chunk.coalesce(|(a_level, a_str), (b_level, b_str)| {
+        let levels_with_first_chunk = levels_with_first_chunk.coalesce(
+            |(a_level, a_str, a_lower_level), (b_level, b_str, b_lower_level)| {
                 if a_str.len() >= b_str.len() {
-                    Ok((b_level, b_str))
+                    Ok((b_level, b_str, b_lower_level))
                 } else {
-                    Err(((a_level, a_str), (b_level, b_str)))
+                    Err((
+                        (a_level, a_str, a_lower_level),
+                        (b_level, b_str, b_lower_level),
+                    ))
                 }
-            });
+            },
+        );
 
-        for (level, str) in levels_with_first_chunk {
+        for (level, str, lower_level) in levels_with_first_chunk {
             // Skip tokenizing levels that we know are too small anyway.
             let len = str.len();
             if len > capacity.max {
-                let chunk_size = self.chunk_size(offset, str, trim);
-                let fits = capacity.fits(chunk_size);
+                let mut lower_boundaries = lower_boundaries_for(lower_level, offset + len);
+                let fits = self.chunk_fits_with_boundaries(
+                    offset,
+                    str,
+                    capacity,
+                    &mut lower_boundaries,
+                    trim,
+                );
                 // If this no longer fits, we use the level we are at.
                 if fits.is_gt() {
+                    // Keep the old search window while avoiding the full-size call
+                    // when lower semantic boundaries prove this section is too large.
                     max_offset = Some(offset + len);
                     break;
                 }
@@ -402,6 +488,51 @@ where
         (semantic_level, max_offset)
     }
 
+    fn chunk_fits_with_boundaries(
+        &mut self,
+        offset: usize,
+        chunk: &str,
+        capacity: &ChunkCapacity,
+        lower_boundaries: &mut impl Iterator<Item = usize>,
+        trim: Trim,
+    ) -> Ordering {
+        let chunk_end = offset + chunk.len();
+        let probe_max = probe_max_size(capacity);
+        let probe_start = offset
+            .saturating_add(capacity.max.saturating_mul(PROBE_START_BYTE_FACTOR).max(1))
+            .min(chunk_end);
+        if probe_start == chunk_end {
+            let chunk_size = self.chunk_size(offset, chunk, trim);
+            return capacity.fits(chunk_size);
+        }
+
+        let mut step: usize = 1;
+        let mut next_boundary =
+            lower_boundaries.find(|&boundary| boundary > offset && boundary >= probe_start);
+
+        while let Some(boundary) = next_boundary {
+            if boundary > chunk_end {
+                break;
+            }
+
+            let prefix = chunk
+                .get(..(boundary - offset))
+                .expect("valid character boundary");
+            let chunk_size = self.chunk_size(offset, prefix, trim);
+            let fits = capacity.fits(chunk_size);
+            if chunk_size > probe_max || boundary == chunk_end {
+                return fits;
+            }
+
+            let skip = step.saturating_sub(1);
+            step = step.saturating_mul(2);
+            next_boundary = lower_boundaries.nth(skip);
+        }
+
+        let chunk_size = self.chunk_size(offset, chunk, trim);
+        capacity.fits(chunk_size)
+    }
+
     /// Clear the cached values. Once we've moved the cursor,
     /// we don't need to keep the old values around.
     pub fn clear_cache(&mut self) {
@@ -409,9 +540,18 @@ where
     }
 }
 
+fn probe_max_size(capacity: &ChunkCapacity) -> usize {
+    capacity
+        .max
+        .saturating_add((capacity.max / PROBE_OVERSHOOT_DIVISOR).max(1))
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{self, AtomicUsize};
+    use std::{
+        cell::RefCell,
+        sync::atomic::{self, AtomicUsize},
+    };
 
     use crate::trim::Trim;
 
@@ -600,6 +740,45 @@ mod tests {
     }
 
     #[test]
+    fn boundary_probe_is_skipped_when_probe_start_is_chunk_end() {
+        let sizer = CountingSizer::default();
+        let mut memoized_sizer = MemoizedChunkSizer::new(&sizer);
+        let mut lower_boundaries = [usize::MAX].into_iter();
+
+        let fits = memoized_sizer.chunk_fits_with_boundaries(
+            0,
+            "12345678901",
+            &ChunkCapacity::new(10),
+            &mut lower_boundaries,
+            Trim::All,
+        );
+
+        assert_eq!(fits, Ordering::Greater);
+        assert_eq!(sizer.calls.load(atomic::Ordering::SeqCst), 1);
+        assert_eq!(lower_boundaries.next(), Some(usize::MAX));
+    }
+
+    #[test]
+    fn boundary_probe_stops_when_next_boundary_exceeds_chunk_end() {
+        let sizer = CountingSizer::default();
+        let mut memoized_sizer = MemoizedChunkSizer::new(&sizer);
+        let chunk = "1234567890".repeat(9);
+        let mut lower_boundaries = [usize::MAX].into_iter();
+
+        let fits = memoized_sizer.chunk_fits_with_boundaries(
+            0,
+            &chunk,
+            &ChunkCapacity::new(10),
+            &mut lower_boundaries,
+            Trim::All,
+        );
+
+        assert_eq!(fits, Ordering::Greater);
+        assert_eq!(sizer.calls.load(atomic::Ordering::SeqCst), 1);
+        assert_eq!(lower_boundaries.next(), None);
+    }
+
+    #[test]
     fn basic_chunk_config() {
         let config = ChunkConfig::new(10);
         assert_eq!(config.capacity, 10.into());
@@ -680,5 +859,57 @@ mod tests {
             err.to_string(),
             "The overlap is larger than or equal to the desired chunk capacity"
         );
+    }
+
+    #[test]
+    fn chunk_size_reference() {
+        let config = ChunkConfig::new(1).with_sizer(&Characters);
+        config.sizer().size("chunk");
+    }
+
+    #[test]
+    fn chunk_size_cow() {
+        let sizer: Cow<'_, Characters> = Cow::Owned(Characters);
+        let config = ChunkConfig::new(1).with_sizer(sizer);
+        config.sizer().size("chunk");
+
+        let sizer = Cow::Borrowed(&Characters);
+        let config = ChunkConfig::new(1).with_sizer(sizer);
+        config.sizer().size("chunk");
+    }
+
+    #[test]
+    fn chunk_size_arc() {
+        let sizer = Arc::new(Characters);
+        let config = ChunkConfig::new(1).with_sizer(sizer);
+        config.sizer().size("chunk");
+    }
+
+    #[test]
+    fn chunk_size_ref() {
+        let sizer = RefCell::new(Characters);
+        let config = ChunkConfig::new(1).with_sizer(sizer.borrow());
+        config.sizer().size("chunk");
+    }
+
+    #[test]
+    fn chunk_size_ref_mut() {
+        let sizer = RefCell::new(Characters);
+        let config = ChunkConfig::new(1).with_sizer(sizer.borrow_mut());
+        config.sizer().size("chunk");
+    }
+
+    #[test]
+    fn chunk_size_box() {
+        let sizer = Box::new(Characters);
+        let config = ChunkConfig::new(1).with_sizer(sizer);
+        config.sizer().size("chunk");
+    }
+
+    #[test]
+    fn chunk_size_rc() {
+        let sizer = Rc::new(Characters);
+        let config = ChunkConfig::new(1).with_sizer(sizer);
+        config.sizer().size("chunk");
     }
 }
